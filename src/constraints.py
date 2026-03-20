@@ -25,8 +25,18 @@ def collision_reformulation(x, y, obs_x, obs_y):
     # 3. d = sqrt((dx/A_OBS)**2 + (dy/B_OBS)**2)
     # 4. enforce d >= 1 via clamp: d = clamp(d, min=1.0)
 
-    alpha = ...
-    d = ...
+    num_obs = obs_x.shape[0] // x.shape[0]
+
+    # tile x, y to (N*num_obs, L) to match obs layout
+    x_tiled = x.repeat(num_obs, 1)
+    y_tiled = y.repeat(num_obs, 1)
+
+    dx = x_tiled - obs_x
+    dy = y_tiled - obs_y
+
+    alpha = torch.atan2(A_OBS * dy, B_OBS * dx)
+    d     = torch.sqrt((dx / A_OBS)**2 + (dy / B_OBS)**2)
+    d     = torch.clamp(d, min=1.0)
 
     return alpha, d
 
@@ -50,7 +60,8 @@ def acceleration_reformulation(x_ddot, y_ddot):
     # 2. d_a     = sqrt(x_ddot**2 + y_ddot**2)
     # 3. enforce d_a <= AMAX via clamp: d_a = clamp(d_a, max=AMAX)
 
-    alpha_a = ...
-    d_a = ...
+    alpha_a = torch.atan2(y_ddot, x_ddot)
+    d_a     = torch.sqrt(x_ddot**2 + y_ddot**2)
+    d_a     = torch.clamp(d_a, max=AMAX)
 
     return alpha_a, d_a

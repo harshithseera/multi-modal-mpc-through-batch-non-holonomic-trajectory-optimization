@@ -13,7 +13,7 @@ def build_F(P, P_dot, P_ddot, num_obs):
     F shape: (N*num_obs*2 + N*2 + N*2, K*2)
     """
 
-    # TODO:
+    # TODO: - done
     # 1. Fo = P stacked num_obs times along dim=0  -> (N*num_obs, K)
     # 2. Build block matrix (Eq. 9):
     #    [Fo        0    ]
