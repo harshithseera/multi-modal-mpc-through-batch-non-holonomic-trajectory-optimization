@@ -40,14 +40,14 @@ def test_P_ddot_zero_columns():
     print("PASS  P_ddot[:,0] and P_ddot[:,1] are zero")
 
 def test_P_dot_numerical():
-    """P_dot should match finite-difference derivative of P to within O(dt)."""
+    """P_dot should match central-difference derivative of P to within O(dt^2)."""
     P, P_dot, _ = build_basis()
     dt = 1.0 / (N - 1)
-    fd = (P[1:] - P[:-1]) / dt          # (N-1, K) forward differences
+    cd = (P[2:] - P[:-2]) / (2 * dt)    # (N-2, K) central differences
     # compare interior rows only (skip boundary effects)
-    assert torch.allclose(P_dot[1:-1], fd[:-1], atol=0.05), \
-        "P_dot doesn't match finite difference"
-    print("PASS  P_dot matches finite difference (atol=0.05)")
+    assert torch.allclose(P_dot[1:-1], cd, atol=0.05), \
+        "P_dot doesn't match central difference"
+    print("PASS  P_dot matches central difference (atol=0.05)")
 
 def test_P_ddot_numerical():
     """P_ddot should match second finite-difference of P."""

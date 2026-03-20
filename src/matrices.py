@@ -23,7 +23,19 @@ def build_F(P, P_dot, P_ddot, num_obs):
     #    [P_dot     0    ]
     #    [0         P_dot]
 
-    F = ...
+    Fo = P.repeat(num_obs, 1)
+    zeros_Fo   = torch.zeros_like(Fo)
+    zeros_P    = torch.zeros_like(P_dot)
+
+    F = torch.cat([
+        torch.cat([Fo,     zeros_Fo], dim=1),   # x collision
+        torch.cat([P_ddot, zeros_P],  dim=1),   # x accel
+        torch.cat([P_dot,  zeros_P],  dim=1),   # x kin
+        torch.cat([zeros_Fo, Fo],     dim=1),   # y collision
+        torch.cat([zeros_P,  P_ddot], dim=1),   # y accel
+        torch.cat([zeros_P,  P_dot],  dim=1),   # y kin
+    ], dim=0)
+
     return F
 
 
@@ -38,9 +50,17 @@ def build_A(P):
     via the independent system A @ cpsi = bpsi (Eq. 19), not here.
     """
 
-    # TODO:
+    # TODO: - done
     # A_block = P[[0, -1], :]        -> (2, K)
     # A = block_diag(A_block, A_block) -> (4, 2*K)
 
-    A = ...
+    # Get boundary rows (first and last)
+    A_block = P[[0, -1], :]  # (2, K)
+
+    # Create block diagonal matrix [A_block, 0; 0, A_block]
+    K_val = P.shape[1]
+    A = torch.zeros(4, 2*K_val, device=P.device)
+    A[:2, :K_val] = A_block
+    A[2:, K_val:] = A_block
+
     return A

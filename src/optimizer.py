@@ -104,12 +104,12 @@ def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y):
 
         # TODO:
         # Stack g to match F block structure (Eq. 9) — all x-rows first, then all y-rows:
-        # [ ξx + A_OBS * d * cos(alpha)  ]  ← collision x    (N*num_obs, L)
-        # [ d_a * cos(alpha_a)           ]  ← acceleration x  (N, L)
-        # [ v.T * cos(P @ cpsi.T)        ]  ← kinematics x    (N, L)
-        # [ ξy + B_OBS * d * sin(alpha)  ]  ← collision y    (N*num_obs, L)
-        # [ d_a * sin(alpha_a)           ]  ← acceleration y  (N, L)
-        # [ v.T * sin(P @ cpsi.T)        ]  ← kinematics y    (N, L)
+        # [ ξx + A_OBS * d * cos(alpha)  ]  ← collision x     (N*num_obs, L)
+        # [ d_a * cos(alpha_a)           ]  ← acceleration x   (N, L)
+        # [ v.T * cos(P @ cpsi.T)        ]  ← kinematics x     (N, L)
+        # [ ξy + B_OBS * d * sin(alpha)  ]  ← collision y     (N*num_obs, L)
+        # [ d_a * sin(alpha_a)           ]  ← acceleration y   (N, L)
+        # [ v.T * sin(P @ cpsi.T)        ]  ← kinematics y     (N, L)
         # g shape: (N*num_obs*2 + N*2 + N*2, L)  — must match F row count exactly
 
         g = ...
