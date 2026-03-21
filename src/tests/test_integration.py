@@ -68,7 +68,8 @@ def test_ego_moves_forward():
     # Use N//4 index — far enough along the polynomial that forward motion
     # is established. P[1] is only t=1/29 into the horizon where the
     # polynomial may still be near the start value.
-    step_idx = N // 4
+    step_idx = 1
+    T_total  = (N - 1) * DT
 
     for t in range(5):
         goals           = sample_goals(ego)
@@ -81,7 +82,7 @@ def test_ego_moves_forward():
         best_cy  = cy[best]
         ego["x"] = (P[step_idx] @ best_cx).item()
         ego["y"] = (P[step_idx] @ best_cy).item()
-        ego["vx"] = (P_dot[step_idx] @ best_cx).item() / DT
+        ego["vx"] = (P_dot[step_idx] @ best_cx).item() / T_total
         ego["vy"] = 0.0
         _, neighbors = get_state(t + 1)
 

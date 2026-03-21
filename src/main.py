@@ -5,7 +5,7 @@ from optimizer import optimize_batch
 from goals import sample_goals
 from data import get_state, predict_obstacles
 from meta_cost import compute_meta_cost
-from config import N, NUM_OBS, DT, VMIN, VMAX
+from config import NUM_OBS, DT, VMIN, VMAX, N
 
 def main():
 
@@ -27,7 +27,7 @@ def main():
         )
 
         y_pos = P @ cy.T                       # (N, L)
-        cost  = compute_meta_cost(v, y_pos, mode="highway")
+        cost  = compute_meta_cost(v, y_pos)
         best  = cost.argmin()
 
         # ── Receding horizon: apply first step of best trajectory ──────────
@@ -36,15 +36,18 @@ def main():
         best_cy   = cy[best]
         best_cpsi = cpsi[best]
 
-        # Use N//4 index — far enough along the polynomial that forward motion
-        # is established. P[1] is only t=1/29 into the horizon where the
-        # polynomial may still be near or below the starting position.
-        step_idx = N // 4
+        # Receding horizon: advance by exactly 1 real timestep (DT).
+        # P is parameterised on t_norm in [0,1], so:
+        #   dx/dt_real = (P_dot @ cx) / T_total   where T_total = (N-1)*DT
+        # Using step_idx=1 corresponds to t_norm=1/(N-1), i.e. one DT ahead.
+        step_idx = 1
+        T_total  = (N - 1) * DT                        # normalised-time chain rule
+
         x_next   = (P[step_idx]     @ best_cx).item()
         y_next   = (P[step_idx]     @ best_cy).item()
         psi_next = (P[step_idx]     @ best_cpsi).item()
-        vx_next  = (P_dot[step_idx] @ best_cx).item() / DT
-        vy_next  = (P_dot[step_idx] @ best_cy).item() / DT
+        vx_next  = (P_dot[step_idx] @ best_cx).item()  / T_total
+        vy_next  = (P_dot[step_idx] @ best_cy).item()  / T_total
 
         # Clamp velocity to physical limits
         speed = (vx_next**2 + vy_next**2) ** 0.5

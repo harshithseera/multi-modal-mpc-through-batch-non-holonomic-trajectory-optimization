@@ -28,65 +28,60 @@ COL_LANE   = "Lane_ID"    # used to derive lateral heading assumption
 # This matches Section III assumption 3 (constant-velocity, road-aligned).
 
 
-# Cache of sorted unique frame IDs — built once on first call
-_frame_index: list = []
+# In-memory frame store — populated once on first call to get_state
+# Filtered to rows that have enough vehicles, keyed by sorted frame index
+_frames: dict = {}          # frame_id -> pd.DataFrame
+_frame_index: list = []     # sorted list of valid frame_ids
 
-def _get_frame_index() -> list:
+def _init_ngsim():
     """
-    Scan the CSV once to collect all unique Frame_IDs in sorted order.
-    Result is cached so subsequent calls are instant.
+    Load the full CSV into memory once, grouped by Frame_ID.
+    Only retains frames that have at least 1 + NUM_OBS vehicles.
+    Called automatically on first get_state() call.
+    ~50-100 MB in memory after filtering — acceptable for a 1.5 GB source file.
     """
-    global _frame_index
+    global _frames, _frame_index
     if _frame_index:
-        return _frame_index
+        return   # already initialised
 
-    ids = set()
-    for chunk in pd.read_csv(_CSV_PATH, chunksize=_CHUNK_SIZE,
-                             usecols=[COL_FRAME]):
-        ids.update(chunk[COL_FRAME].unique())
+    print(f"[data] Loading {_CSV_PATH} into memory (one-time, please wait)...")
+    all_chunks = []
+    for chunk in pd.read_csv(_CSV_PATH, chunksize=_CHUNK_SIZE):
+        all_chunks.append(chunk)
+    df = pd.concat(all_chunks, ignore_index=True)
 
-    _frame_index = sorted(ids)
-    return _frame_index
+    # Group by frame, keep only frames with enough vehicles
+    grouped = df.groupby(COL_FRAME)
+    valid = []
+    for fid, grp in grouped:
+        if len(grp) >= 1 + NUM_OBS:
+            # sort by longitudinal position descending once at load time
+            _frames[fid] = grp.sort_values(
+                COL_X, ascending=False
+            ).reset_index(drop=True)
+            valid.append(fid)
+
+    _frame_index = sorted(valid)
+    print(f"[data] Loaded {len(_frame_index)} valid frames.")
 
 
 def _load_frame(frame_id: int) -> pd.DataFrame:
-    """
-    Return all rows for a given frame_id by scanning the CSV in chunks.
-    Stops as soon as the frame is found and passed, so worst-case reads
-    the whole file once but typical case is much faster for early frames.
-    """
-    found = []
-    past  = False
+    """Return the pre-loaded DataFrame for frame_id (O(1) dict lookup)."""
+    if frame_id not in _frames:
+        raise ValueError(f"frame_id {frame_id} not in loaded frames.")
+    return _frames[frame_id]
 
-    for chunk in pd.read_csv(_CSV_PATH, chunksize=_CHUNK_SIZE):
-        if COL_FRAME not in chunk.columns:
-            raise ValueError(
-                f"Column '{COL_FRAME}' not found. "
-                f"Available columns: {list(chunk.columns)}"
-            )
-        rows = chunk[chunk[COL_FRAME] == frame_id]
-        if not rows.empty:
-            found.append(rows)
-            past = True
-        elif past:
-            # frame rows are contiguous — stop once we have passed them
-            break
 
-    if not found:
-        raise ValueError(f"frame_id {frame_id} not found in {_CSV_PATH}")
-
-    return pd.concat(found, ignore_index=True)
-
+_FT_TO_M = 0.3048   # NGSIM positions are in feet, velocities in ft/s
 
 def _row_to_dict(row: pd.Series) -> dict:
-    """Convert a DataFrame row to the ego/neighbor state dict."""
-    # NGSIM provides scalar speed (v_Vel) but not vx/vy separately.
-    # Road-aligned assumption: vx = v_Vel, vy = 0, psi = 0.
+    """Convert a DataFrame row to the ego/neighbor state dict.
+    Converts from NGSIM feet/ft·s⁻¹ to metres/m·s⁻¹."""
     return {
-        "x":   float(row[COL_X]),
-        "y":   float(row[COL_Y]),
+        "x":   float(row[COL_X])   * _FT_TO_M,
+        "y":   float(row[COL_Y])   * _FT_TO_M,
         "psi": 0.0,
-        "vx":  float(row[COL_VEL]),
+        "vx":  float(row[COL_VEL]) * _FT_TO_M,
         "vy":  0.0,
     }
 
@@ -112,24 +107,17 @@ def get_state(t: int):
 
 
 def _get_state_ngsim(t: int):
-    """Load one MPC step from the NGSIM CSV using t as a frame index.
-    Skips frames that don't have enough vehicles, advancing until one does."""
-    index = _get_frame_index()
-
-    for offset in range(len(index) - t):
-        idx      = t + offset
-        frame_id = index[idx]
-        frame    = _load_frame(frame_id)
-        frame    = frame.sort_values(COL_X, ascending=False).reset_index(drop=True)
-
-        if len(frame) >= 1 + NUM_OBS:
-            ego       = _row_to_dict(frame.iloc[0])
-            neighbors = [_row_to_dict(frame.iloc[i + 1]) for i in range(NUM_OBS)]
-            return ego, neighbors
-
-    raise ValueError(
-        f"No frame from t={t} onward has at least {1 + NUM_OBS} vehicles."
-    )
+    """Load one MPC step from the in-memory NGSIM frames using t as index."""
+    _init_ngsim()
+    if t >= len(_frame_index):
+        raise ValueError(
+            f"t={t} out of range — {len(_frame_index)} valid frames (0…{len(_frame_index)-1})"
+        )
+    frame_id = _frame_index[t]
+    frame    = _load_frame(frame_id)   # O(1) dict lookup
+    ego       = _row_to_dict(frame.iloc[0])
+    neighbors = [_row_to_dict(frame.iloc[i + 1]) for i in range(NUM_OBS)]
+    return ego, neighbors
 
 
 def _get_state_synthetic(t: int):
