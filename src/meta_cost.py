@@ -7,19 +7,25 @@ def compute_meta_cost(v, y, mode="cruise", v_cruise=10.0, y_right=0.0, w1=1.0, w
 
     v: (L, N)  velocity profiles  — as returned by optimize_batch
     y: (N, L)  lateral position profiles  — P @ cy.T from optimize_batch
-               Must be transposed to (L, N) before computing cost:
-               y_LN = y.T  so both v and y are (L, N) when summing over time axis
+               Transposed to (L, N) internally before computing cost.
 
     Returns:
         cost: (L,)  scalar cost per trajectory (lower is better)
     """
+    y_LN = y.T    # (L, N)
 
-    # TODO:
-    # Cruise driving (Eq. 25):
-    #   cost = sum_t (v(t) - v_cruise)**2
+    if mode == "cruise":
+        # Eq. (25): penalise deviation from cruise speed
+        cost = ((v - v_cruise) ** 2).sum(dim=1)   # (L,)
 
-    # High-speed + right-lane preference (Eq. 26):
-    #   cost = sum_t  w1*(v(t) - vmax)**2 + w2*(y(t) - y_right)**2
+    elif mode == "highway":
+        # Eq. (26): penalise deviation from max speed AND distance to right lane
+        cost = (
+            w1 * (v    - VMAX)    ** 2 +
+            w2 * (y_LN - y_right) ** 2
+        ).sum(dim=1)                               # (L,)
 
-    cost = ...
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Use 'cruise' or 'highway'.")
+
     return cost
