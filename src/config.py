@@ -1,29 +1,39 @@
+"""
+Global hyperparameters for the multi-modal MPC system.
+
+Paper reference: Section IV (Implementation Details).
+"""
+
 import torch
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-N  = 30
-K  = 8
-DT = 0.1
+# ── Trajectory parameterisation (Section III-B, Eq. 6) ──────────────────────
+N  = 30    # number of discrete time knots in the planning horizon
+K  = 8     # polynomial degree (number of basis coefficients per axis)
+DT = 0.1   # time step [s]; planning horizon T = (N-1)*DT = 2.9 s
 
-L       = 8
-NUM_OBS = 3
+# ── Batch size (Section III-F) ───────────────────────────────────────────────
+L = 8      # number of parallel goal-directed trajectory instances
 
-MAX_ITERS = 100
+# ── Obstacle model (Section II-B, Eq. 1e) ───────────────────────────────────
+NUM_OBS = 3   # number of obstacles considered per MPC step
 
-# ADMM penalty — must be large enough that the collision proximal pull
-# dominates the smoothness cost. With WEIGHT_SMOOTHNESS=1 and the
-# polynomial basis scaled to [0,1], RHO=100 gives strong enough penalty.
-RHO        = 100.0
-RHO_OBS    = RHO
-RHO_NONHOL = RHO
-RHO_INEQ   = RHO
+# ── ADMM solver (Section III-D) ─────────────────────────────────────────────
+MAX_ITERS  = 100   # Algorithm 1 iteration count
+RHO        = 100.0  # augmented-Lagrangian penalty weight ρ (Section III-D)
+RHO_OBS    = RHO    # ρ applied to collision constraint rows
+RHO_NONHOL = RHO    # ρ applied to non-holonomic kinematic rows
+RHO_INEQ   = RHO    # ρ applied to acceleration constraint rows
 
-WEIGHT_SMOOTHNESS = 1.0
+# ── Cost weights ─────────────────────────────────────────────────────────────
+WEIGHT_SMOOTHNESS = 1.0   # weight on ‖ẍ‖² + ‖ÿ‖² + ‖ψ̈‖² (Eq. 1a)
 
-AMAX = 4.0
-VMIN = 0.1
-VMAX = 15.0
+# ── Physical limits (Section II-B, Eq. 1d) ──────────────────────────────────
+AMAX = 4.0    # maximum total acceleration [m/s²]
+VMIN = 0.1    # minimum forward speed [m/s]
+VMAX = 15.0   # maximum forward speed [m/s]
 
-A_OBS = 5.6
-B_OBS = 3.1
+# ── Elliptical safety region (Section II-B, Eq. 1e; Section IV) ─────────────
+A_OBS = 5.6   # semi-axis along longitudinal direction [m] (includes ego inflation)
+B_OBS = 3.1   # semi-axis along lateral direction [m]
