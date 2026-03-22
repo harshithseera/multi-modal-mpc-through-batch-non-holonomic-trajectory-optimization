@@ -1,138 +1,171 @@
 import torch
-from config import L, K, N, RHO, VMIN, VMAX, MAX_ITERS, A_OBS, B_OBS, DEVICE
+from config import (
+    L, K, N,
+    RHO_OBS, RHO_NONHOL, RHO_INEQ,
+    VMIN, VMAX, MAX_ITERS,
+    A_OBS, B_OBS, DEVICE, DT,
+    WEIGHT_SMOOTHNESS,
+)
 from constraints import collision_reformulation, acceleration_reformulation
+
 
 def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego):
     """
-    A:     (4, 2*K)  boundary constraint matrix from build_A(P)
-    goals: (L, 4)    each row is (x_goal, y_goal, psi_goal, v_goal)
-    ego:   dict with keys x, y — used to construct bl for KKT boundary constraints
+    Batch non-holonomic trajectory optimizer (Eq. 17-24, Algorithm 1).
+
+    IMPORTANT: all computation is done in ego-relative coordinates.
+    obs_x, obs_y and goals arrive in world frame — they are shifted here.
+    Returned cx, cy are world-frame (ox/oy baked into cx[:,0], cy[:,0]).
     """
 
-    # ==========================================
-    # INIT (Section IV)
-    # ==========================================
+    # ------------------------------------------------------------------
+    # 1. Ego-relative shift — MUST happen before anything else
+    #    Without this, collision_reformulation sees dx = ~0 - 150 = -150
+    #    so d >> 1 always and the collision constraint is never active.
+    # ------------------------------------------------------------------
+    ox  = float(ego["x"])
+    oy  = float(ego["y"])
+    vx0 = max(float(ego.get("vx", 5.0)), VMIN)
 
-    cx   = torch.zeros(L, K, device=DEVICE)
-    cy   = torch.zeros(L, K, device=DEVICE)
-    cpsi = torch.zeros(L, K, device=DEVICE)
+    goals_r  = goals.clone()
+    goals_r[:, 0] -= ox
+    goals_r[:, 1] -= oy
 
-    # v shape is (L, N) to match meta_cost expected input (L, N)
-    # Note: x_dot = P_dot @ cx.T is (N, L), so v = sqrt(...).T gives (L, N)
-    v = torch.ones(L, N, device=DEVICE) * 5.0
+    obs_xr = obs_x - ox   # (N*num_obs, L)
+    obs_yr = obs_y - oy
 
-    lam_xy  = torch.zeros(L, 2*K, device=DEVICE)
-    lam_psi = torch.zeros(L,   K, device=DEVICE)
-
-    # ==========================================
-    # PRECOMPUTE (Eq. 17-18)
-    # ==========================================
-
-    Q_single = P_ddot.T @ P_ddot                     # (K, K)
-    Q        = torch.block_diag(Q_single, Q_single)   # (2K, 2K)
-
-    # Full KKT matrix (Eq. 17) — precomputed once, inverted once
-    n_bc = A.shape[0]                                  # 4
-    Qxy  = torch.zeros(2*K + n_bc, 2*K + n_bc, device=DEVICE)
-    Qxy[:2*K, :2*K] = Q + RHO * (Fmat.T @ Fmat)
-    Qxy[:2*K, 2*K:] = A.T
-    Qxy[2*K:, :2*K] = A
-    Qxy_inv = torch.linalg.inv(Qxy)                   # (2K+4, 2K+4)
-
-    # bl shape (4, L): boundary values per batch instance
-    # rows = [x(0), x(T), y(0), y(T)]
-    bl      = torch.zeros(n_bc, L, device=DEVICE)
-    bl[0]   = ego["x"]           # x start — same for all L
-    bl[1]   = goals[:, 0]        # x goal  — differs per instance
-    bl[2]   = ego["y"]           # y start — same for all L
-    bl[3]   = goals[:, 1]        # y goal  — differs per instance
-
-    # Precompute Qpsi_inv for heading update (Eq. 19/20)
-    Qpsi     = Q_single + RHO * (P.T @ P)
-    Qpsi_inv = torch.linalg.inv(Qpsi)                 # (K, K)
-
-    # infer num_obs from obs_x shape
+    # ------------------------------------------------------------------
+    # 2. Real-time scaled basis
+    # ------------------------------------------------------------------
     num_obs = obs_x.shape[0] // N
+    Fo      = P.repeat(num_obs, 1)    # (N*num_obs, K)
+    T       = (N - 1) * DT
+    Pd      = P_dot  / T
+    Pdd     = P_ddot / (T * T)
 
-    # ==========================================
-    # MAIN LOOP (Algorithm 1)
-    # ==========================================
+    # ------------------------------------------------------------------
+    # 3. F matrix — row order: obs_x, acc_x, kin_x, obs_y, acc_y, kin_y
+    # ------------------------------------------------------------------
+    z_Fo = torch.zeros_like(Fo)
+    z_P  = torch.zeros_like(Pd)
 
+    F = torch.cat([
+        torch.cat([Fo,  z_Fo], dim=1),   # obs x
+        torch.cat([Pdd, z_P],  dim=1),   # acc x
+        torch.cat([Pd,  z_P],  dim=1),   # kin x
+        torch.cat([z_Fo, Fo],  dim=1),   # obs y
+        torch.cat([z_P,  Pdd], dim=1),   # acc y
+        torch.cat([z_P,  Pd],  dim=1),   # kin y
+    ], dim=0)   # (F_rows, 2K)
+
+    n_obs_r = Fo.shape[0]   # N * num_obs
+
+    # Per-row rho
+    rho_vec = torch.cat([
+        torch.full((n_obs_r,), RHO_OBS,    device=DEVICE),
+        torch.full((N,),       RHO_INEQ,   device=DEVICE),
+        torch.full((N,),       RHO_NONHOL, device=DEVICE),
+        torch.full((n_obs_r,), RHO_OBS,    device=DEVICE),
+        torch.full((N,),       RHO_INEQ,   device=DEVICE),
+        torch.full((N,),       RHO_NONHOL, device=DEVICE),
+    ])   # (F_rows,)
+
+    F_w   = F * rho_vec.unsqueeze(1)   # (F_rows, 2K)
+    FtF_w = F.T @ F_w                  # (2K, 2K)
+
+    # ------------------------------------------------------------------
+    # 4. KKT matrix — precomputed once (constant across iterations)
+    # ------------------------------------------------------------------
+    Qs    = WEIGHT_SMOOTHNESS * (Pdd.T @ Pdd)
+    Q     = torch.block_diag(Qs, Qs)
+    n_bc  = A.shape[0]   # 4
+
+    Qxy = torch.zeros(2*K + n_bc, 2*K + n_bc, dtype=torch.float64, device=DEVICE)
+    Qxy[:2*K, :2*K] = (Q + FtF_w).double()
+    Qxy[:2*K, 2*K:] = A.double().T
+    Qxy[2*K:, :2*K] = A.double()
+    Qxy_inv = torch.linalg.inv(Qxy)   # float64, once
+
+    # ------------------------------------------------------------------
+    # 5. Boundary conditions — relative frame: start=(0,0), end=goal_rel
+    # ------------------------------------------------------------------
+    bl = torch.zeros(n_bc, L, device=DEVICE)
+    bl[0] = 0.0;             bl[2] = 0.0
+    bl[1] = goals_r[:, 0];   bl[3] = goals_r[:, 1]
+
+    # ------------------------------------------------------------------
+    # 6. Heading KKT — precomputed once
+    # ------------------------------------------------------------------
+    Qpsi_m   = (WEIGHT_SMOOTHNESS * Pdd.T @ Pdd + RHO_NONHOL * P.T @ P).double()
+    Qpsi_inv = torch.linalg.inv(Qpsi_m)
+
+    # ------------------------------------------------------------------
+    # 7. Initialise: straight line from (0,0) to each goal in rel frame
+    # ------------------------------------------------------------------
+    cx = torch.zeros(L, K, device=DEVICE)
+    cy = torch.zeros(L, K, device=DEVICE)
+    for l in range(L):
+        cx[l, 1] = float(goals_r[l, 0])
+        cy[l, 1] = float(goals_r[l, 1])
+
+    cpsi   = torch.zeros(L, K, device=DEVICE)
+    v      = torch.full((L, N), vx0, device=DEVICE)
+    lam_xy = torch.zeros(2*K, L, device=DEVICE)
+
+    # ------------------------------------------------------------------
+    # 8. ADMM iterations
+    # ------------------------------------------------------------------
     for _ in range(MAX_ITERS):
 
-        # --------------------------------------
-        # STEP (12): update cx, cy
-        # --------------------------------------
+        # trajectory in relative frame
+        x   = P   @ cx.T   # (N, L)
+        y   = P   @ cy.T
+        xd  = Pd  @ cx.T
+        yd  = Pd  @ cy.T
+        xdd = Pdd @ cx.T
+        ydd = Pdd @ cy.T
 
-        x      = P      @ cx.T     # (N, L)
-        y      = P      @ cy.T
-        x_dot  = P_dot  @ cx.T     # (N, L)
-        y_dot  = P_dot  @ cy.T
-        x_ddot = P_ddot @ cx.T     # (N, L)
-        y_ddot = P_ddot @ cy.T
+        # auxiliary proximal steps — use RELATIVE obs
+        alpha,   d   = collision_reformulation(x, y, obs_xr, obs_yr)
+        alpha_a, d_a = acceleration_reformulation(xdd, ydd)
+        psi          = P @ cpsi.T
 
-        # collision variables (Eq. 4)
-        alpha, d = collision_reformulation(x, y, obs_x, obs_y)
+        # g uses RELATIVE obs positions
+        g = torch.cat([
+            obs_xr + A_OBS * d * torch.cos(alpha),
+            d_a             * torch.cos(alpha_a),
+            v.T             * torch.cos(psi),
+            obs_yr + B_OBS * d * torch.sin(alpha),
+            d_a             * torch.sin(alpha_a),
+            v.T             * torch.sin(psi),
+        ], dim=0)   # (F_rows, L)
 
-        # acceleration variables (Eq. 5)
-        alpha_a, d_a = acceleration_reformulation(x_ddot, y_ddot)
+        # KKT solve (Eq. 18)
+        rhs_top = F_w.T @ g + lam_xy
+        rhs     = torch.cat([rhs_top, bl], dim=0).double()
+        sol     = Qxy_inv @ rhs
+        cx      = sol[:K].T.float()
+        cy      = sol[K:2*K].T.float()
 
-        # --------------------------------------
-        # Build g (Eq. 9 RHS)
-        # all x-rows first, then all y-rows — must match F row order exactly
-        # --------------------------------------
+        # heading update
+        xd = Pd @ cx.T
+        yd = Pd @ cy.T
+        psi_tgt  = torch.atan2(yd, xd)
+        rhs_psi  = (RHO_NONHOL * P.T @ psi_tgt).double()
+        cpsi     = (Qpsi_inv @ rhs_psi).T.float()
 
-        psi = P @ cpsi.T    # (N, L)
+        # velocity update
+        v = torch.clamp(torch.sqrt(xd**2 + yd**2).T, VMIN, VMAX)
 
-        gx_col = obs_x + A_OBS * d * torch.cos(alpha)   # (N*num_obs, L)
-        gx_acc = d_a           * torch.cos(alpha_a)      # (N, L)
-        gx_kin = v.T           * torch.cos(psi)          # (N, L)
-        gy_col = obs_y + B_OBS * d * torch.sin(alpha)
-        gy_acc = d_a           * torch.sin(alpha_a)
-        gy_kin = v.T           * torch.sin(psi)
+        # dual update (Eq. 23): lam -= F_w^T @ (F*c - g)
+        cxy      = torch.cat([cx.T, cy.T], dim=0)
+        residual = F @ cxy - g
+        lam_xy   = lam_xy - F_w.T @ residual
 
-        g = torch.cat([gx_col, gx_acc, gx_kin,
-                       gy_col, gy_acc, gy_kin], dim=0)   # (F_rows, L)
-
-        # --------------------------------------
-        # Solve full KKT system (Eq. 18)
-        # --------------------------------------
-
-        rhs = torch.cat([RHO * Fmat.T @ g + lam_xy.T, bl], dim=0)  # (2K+4, L)
-        sol = Qxy_inv @ rhs                                           # (2K+4, L)
-
-        cx = sol[:K].T      # (L, K)
-        cy = sol[K:2*K].T
-
-        # --------------------------------------
-        # STEP (13): update heading (Eq. 19/20)
-        # --------------------------------------
-
-        psi_target = torch.atan2(y_dot, x_dot)              # (N, L)
-        rhs_psi    = RHO * P.T @ psi_target + lam_psi.T     # (K, L)
-        cpsi       = (Qpsi_inv @ rhs_psi).T                 # (L, K)
-
-        # --------------------------------------
-        # STEP (14): velocity (Eq. 21)
-        # --------------------------------------
-
-        # x_dot, y_dot are (N, L); take .T to get v as (L, N) for meta_cost
-        v = torch.sqrt(x_dot**2 + y_dot**2).T
-        v = torch.clamp(v, VMIN, VMAX)
-
-        # --------------------------------------
-        # STEP (23): lambda_xy (Eq. 23)
-        # --------------------------------------
-
-        xy_stack    = torch.cat([cx.T, cy.T], dim=0)            # (2K, L)
-        residual_xy = Fmat @ xy_stack - g                        # (F_rows, L)
-        lam_xy      = lam_xy - (RHO * Fmat.T @ residual_xy).T   # (L, 2K)
-
-        # --------------------------------------
-        # STEP (24): lambda_psi (Eq. 24)
-        # --------------------------------------
-
-        residual_psi = torch.atan2(y_dot, x_dot) - P @ cpsi.T   # (N, L)
-        lam_psi      = lam_psi - (RHO * P.T @ residual_psi).T   # (L, K)
+    # ------------------------------------------------------------------
+    # 9. Shift back to world frame
+    # ------------------------------------------------------------------
+    cx[:, 0] += ox
+    cy[:, 0] += oy
 
     return cx, cy, cpsi, v
