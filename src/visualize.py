@@ -7,6 +7,7 @@ Displays:
   - Candidate trajectories (grey) and optimal trajectory (red) from the
     batch optimizer (Section III-F).
   - All vehicles in the current NGSIM frame (blue).
+  - MPC obstacle neighbors (same blue as background).
   - Ego vehicle (pink), scrolling viewport centred on ego.
   - Stats bar: collision flag, average speed, heading, trajectory count.
 """
@@ -28,7 +29,7 @@ from optimizer import optimize_batch
 from goals import sample_goals
 from data import get_state, predict_obstacles, get_all_vehicles
 from meta_cost import compute_meta_cost
-from config import NUM_OBS, DT, VMIN, VMAX, L, N, A_OBS, B_OBS
+from config import NUM_OBS, DT, VMIN, VMAX, L, N, A_OBS, B_OBS, HEADING_LIMIT_DEG
 
 # ── Display parameters ────────────────────────────────────────────────────────
 VIS_A = 2.5   # vehicle ellipse half-length for display [m]
@@ -85,24 +86,31 @@ def _check_collision(ego, vehicles):
 
 def _draw_vehicles(ax, vehicles, ego_id, vlo, vhi):
     """
-    Draw all non-ego vehicles as uniform blue ellipses with speed labels.
-    Labels are suppressed when vehicles are too close together to avoid clutter.
+    Draw all non-ego vehicles.
+    Draw all non-ego vehicles as blue ellipses with speed labels.
     """
     placed = []
     for v in vehicles:
-        if v.get("vehicle_id") == ego_id:
+        vid = v.get("vehicle_id")
+        if vid == ego_id:
             continue
         lon, lat = v["x"], v["y"]
-        if not (vlo - VIS_A <= lon <= vhi + VIS_A):
+        if not (vlo - A_OBS <= lon <= vhi + A_OBS):
             continue
+
+
+        fc = OBS_COL
+        ec = OBS_EDGE
+        zo = 4
+
         ax.add_patch(mpatches.Ellipse(
             (lon, lat), width=2*VIS_A, height=2*VIS_B,
-            facecolor=OBS_COL, edgecolor=OBS_EDGE,
-            linewidth=1.0, zorder=4))
+            facecolor=fc, edgecolor=ec, linewidth=1.0, zorder=zo))
+
         if not any(abs(lon - px) < MIN_LABEL_SEP_X and abs(lat - py) < MIN_LABEL_SEP_Y
                    for px, py in placed):
             ax.text(lon, lat, f"{v['vx']:.1f}", color=OBS_TXT, fontsize=7,
-                    ha="center", va="center", zorder=5, fontweight="bold")
+                    ha="center", va="center", zorder=zo + 1, fontweight="bold")
             placed.append((lon, lat))
 
 
@@ -141,11 +149,19 @@ def main():
         x_trajs = (P @ cx.T).detach().cpu().numpy()   # (N, L)
         y_trajs = (P @ cy.T).detach().cpu().numpy()
 
-        # Meta-cost ranking (Section III-F, Eq. 26)
+        # Meta-cost ranking with heading filter (Section III-F, Eq. 26)
         y_pos = P @ cy.T
         cost  = compute_meta_cost(v, y_pos, mode=META_MODE,
                                   y_right=Y_RIGHT, w1=W1, w2=W2)
-        best  = cost.argmin().item()
+
+        # Discard trajectories with total heading change > HEADING_LIMIT_DEG
+        xd_t      = (P_dot / T_total) @ cx.T
+        yd_t      = (P_dot / T_total) @ cy.T
+        psi_t     = torch.atan2(yd_t, xd_t)
+        delta_deg = torch.abs(psi_t[-1] - psi_t[0]) * 180.0 / torch.pi
+        cost[delta_deg > HEADING_LIMIT_DEG] = float("inf")
+
+        best = cost.argmin().item()
 
         bcx, bcy = cx[best], cy[best]
 
@@ -186,10 +202,11 @@ def main():
             ax.plot(x_trajs[:, li], y_trajs[:, li],
                     color=CAND_COL, linewidth=1.0, alpha=0.5, zorder=2)
 
-        # Optimal trajectory (lowest meta-cost)
+        # Optimal trajectory (lowest meta-cost after heading filter)
         ax.plot(x_trajs[:, best], y_trajs[:, best],
                 color=BEST_COL, linewidth=2.5, zorder=3, solid_capstyle="round")
 
+        # All vehicles — uniform blue
         _draw_vehicles(ax, all_vehicles, ego.get("vehicle_id"), vlo, vhi)
 
         # Ego vehicle
@@ -209,7 +226,8 @@ def main():
             Line2D([0], [0], color=BEST_COL, lw=2.5, label="Optimal trajectory"),
             Line2D([0], [0], color=CAND_COL, lw=1.0, alpha=0.6,
                    label="Candidate trajectories"),
-            mpatches.Patch(facecolor=OBS_COL, edgecolor=OBS_EDGE, label="Vehicles"),
+            mpatches.Patch(facecolor=OBS_COL, edgecolor=OBS_EDGE,
+                           label="Background vehicles"),
             mpatches.Patch(facecolor=EGO_COL, edgecolor=EGO_EDGE, label="Ego"),
         ], fontsize=7.5, loc="upper right", facecolor="white",
            edgecolor="#cccccc", framealpha=0.9)
@@ -244,8 +262,9 @@ def main():
             "vehicle_id": ego.get("vehicle_id"),
         }
 
-        print(f"Step {t:3d} | best={best} | collision={collision} | "
-              f"ego=({x_next:.1f},{y_next:.1f}) | vx={vx_next:.2f}")
+        print(f"Step {t:3d} | best={best} | hdg={delta_deg[best].item():.1f}° | "
+              f"collision={collision} | ego=({x_next:.1f},{y_next:.1f}) | "
+              f"vx={vx_next:.2f}")
 
     plt.ioff()
     plt.show()

@@ -48,7 +48,7 @@ def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego):
     obs_x, obs_y : (N * NUM_OBS, L)
         World-frame obstacle trajectory predictions from predict_obstacles().
     ego : dict
-        Current ego state with keys 'x', 'y', 'vx'.
+        Current ego state with keys 'x', 'y', 'vx', 'psi'.
 
     Returns
     -------
@@ -67,6 +67,7 @@ def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego):
     ox  = float(ego["x"])
     oy  = float(ego["y"])
     vx0 = max(float(ego.get("vx", 5.0)), VMIN)
+    psi0 = float(ego.get("psi", 0.0))
 
     goals_r = goals.clone()
     goals_r[:, 0] -= ox
@@ -123,14 +124,19 @@ def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego):
     # KKT structure:
     #   [ Q + F^T diag(ρ) F    A^T ] [ cx; cy ]   [ F^T diag(ρ) g + λ ]
     #   [ A                    0   ] [  μ     ] = [ bl                  ]
+    #
+    # A small regulariser ε on the zero block makes the saddle-point system
+    # strictly quasi-definite, stabilising the float64 inversion.
     Qs   = WEIGHT_SMOOTHNESS * (Pdd.T @ Pdd)   # (K, K); Eq. (8a)
     Q    = torch.block_diag(Qs, Qs)            # (2K, 2K)
     n_bc = A.shape[0]                          # 4
+    eps  = 1e-6
 
     Qxy = torch.zeros(2*K + n_bc, 2*K + n_bc, dtype=torch.float64, device=DEVICE)
     Qxy[:2*K, :2*K] = (Q + FtF_w).double()
     Qxy[:2*K, 2*K:] = A.double().T
     Qxy[2*K:, :2*K] = A.double()
+    Qxy[2*K:, 2*K:] = -eps * torch.eye(n_bc, dtype=torch.float64, device=DEVICE)
     Qxy_inv = torch.linalg.inv(Qxy)   # precomputed in float64 for numerical stability
 
     # ── Boundary condition vector bl (Eq. 8b) ─────────────────────────
@@ -141,10 +147,24 @@ def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego):
     bl[1] = goals_r[:, 0];  bl[3] = goals_r[:, 1]
 
     # ── Heading KKT matrix (Eq. 19) ───────────────────────────────────
-    # The heading update (Step 13) also reduces to a linear system.
-    # Q_ψ = WEIGHT_SMOOTHNESS * P̈^T P̈ + ρ * P^T P  (Eq. 19, left-hand side)
-    Qpsi_m   = (WEIGHT_SMOOTHNESS * Pdd.T @ Pdd + RHO_NONHOL * P.T @ P).double()
-    Qpsi_inv = torch.linalg.inv(Qpsi_m)
+    # Full KKT enforcing ψ(0) = psi0, ψ(T) = 0 (road-aligned at goal).
+    # Structure mirrors the xy KKT:
+    #   [ Q_ψ + ρ P^T P    A_ψ^T ] [ cpsi ]   [ ρ P^T psi_tgt + λ_ψ ]
+    #   [ A_ψ              0     ] [  μ   ] = [ bpsi                  ]
+    A_psi    = P[[0, -1], :]   # (2, K): ψ(0) and ψ(T) boundary rows
+    n_psi    = A_psi.shape[0]  # 2
+
+    Qpsi_mat = torch.zeros(K + n_psi, K + n_psi, dtype=torch.float64, device=DEVICE)
+    Qpsi_mat[:K, :K] = (WEIGHT_SMOOTHNESS * Pdd.T @ Pdd + RHO_NONHOL * P.T @ P).double()
+    Qpsi_mat[:K, K:] = A_psi.T.double()
+    Qpsi_mat[K:, :K] = A_psi.double()
+    Qpsi_mat[K:, K:] = -eps * torch.eye(n_psi, dtype=torch.float64, device=DEVICE)
+    Qpsi_inv = torch.linalg.inv(Qpsi_mat)   # (K+2, K+2)
+
+    # Heading boundary values: ψ(0) = ego heading, ψ(T) = 0
+    bpsi = torch.zeros(n_psi, L, device=DEVICE)
+    bpsi[0] = psi0   # ψ(0) = current ego heading
+    bpsi[1] = 0.0    # ψ(T) = 0 (road-aligned at goal horizon)
 
     # ── Initialisation (Section IV) ───────────────────────────────────
     # Straight-line trajectory from (0,0) to each goal in relative frame.
@@ -156,9 +176,13 @@ def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego):
         cx[l, 1] = float(goals_r[l, 0])
         cy[l, 1] = float(goals_r[l, 1])
 
-    cpsi   = torch.zeros(L, K, device=DEVICE)
+    # Heading warm-start: constant ego heading across horizon
+    cpsi        = torch.zeros(L, K, device=DEVICE)
+    cpsi[:, 0]  = psi0
+
     v      = torch.full((L, N), vx0, device=DEVICE)
-    lam_xy = torch.zeros(2*K, L, device=DEVICE)   # Lagrange multipliers λ (Eq. 10)
+    lam_xy = torch.zeros(2*K, L, device=DEVICE)    # λ for xy (Eq. 10)
+    lam_psi = torch.zeros(K, L, device=DEVICE)     # λ for ψ
 
     # ── Algorithm 1: Alternating Minimisation ─────────────────────────
     for _ in range(MAX_ITERS):
@@ -195,22 +219,28 @@ def optimize_batch(P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego):
         cx      = sol[:K].T.float()
         cy      = sol[K:2*K].T.float()
 
-        # Step 13: heading update — convex surrogate (Eq. 13, last line; Eq. 20)
-        # The non-holonomic heading penalty is replaced by the convex surrogate
-        # ‖atan2(ẏ, ẋ) - Pψ‖² for a given (ẋ, ẏ), giving a linear system.
+        # Step 13: heading update — full KKT with boundary constraints (Eq. 19/20)
         xd = Pd @ cx.T
         yd = Pd @ cy.T
-        psi_tgt  = torch.atan2(yd, xd)                       # Eq. (13), last line
-        rhs_psi  = (RHO_NONHOL * P.T @ psi_tgt).double()
-        cpsi     = (Qpsi_inv @ rhs_psi).T.float()            # Eq. (20)
+        psi_tgt = torch.atan2(yd, xd)   # Eq. (13), last line
+
+        rhs_psi = torch.cat([
+            (RHO_NONHOL * P.T @ psi_tgt + lam_psi).double(),   # (K, L)
+            bpsi.double()                                         # (2, L)
+        ], dim=0)                                                 # (K+2, L)
+        sol_psi = Qpsi_inv @ rhs_psi                             # (K+2, L)
+        cpsi    = sol_psi[:K].T.float()                          # (L, K)
 
         # Step 14: velocity update — element-wise clip (Eq. 21)
         v = torch.clamp(torch.sqrt(xd**2 + yd**2).T, VMIN, VMAX)
 
-        # Multiplier update — split-Bregman dual ascent (Eq. 23)
+        # Multiplier updates — split-Bregman dual ascent (Eq. 23/24)
         cxy      = torch.cat([cx.T, cy.T], dim=0)   # (2K, L)
-        residual = F @ cxy - g                       # constraint residual (F_rows, L)
-        lam_xy   = lam_xy - F_w.T @ residual         # λ ← λ - F^T diag(ρ)(Fc - g)
+        residual = F @ cxy - g                       # (F_rows, L)
+        lam_xy   = lam_xy - F_w.T @ residual         # λ_xy ← λ - F^T diag(ρ)(Fc - g)
+
+        residual_psi = psi_tgt - P @ cpsi.T          # (N, L)
+        lam_psi      = lam_psi - RHO_NONHOL * P.T @ residual_psi   # (K, L)
 
     # ── Restore world-frame coordinates ───────────────────────────────
     # Adding ox to cx[:,0] is equivalent to shifting x(τ) = P @ cx.T

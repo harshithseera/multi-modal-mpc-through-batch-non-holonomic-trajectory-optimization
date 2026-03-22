@@ -8,7 +8,8 @@ At each step t the MPC:
   2. Predicts obstacle trajectories (Section III, Assumption 3).
   3. Runs the batch optimizer to produce L locally optimal trajectories
      (Algorithm 1).
-  4. Selects the best trajectory via meta-cost (Section III-F, Eq. 25/26).
+  4. Selects the best trajectory via meta-cost (Section III-F, Eq. 25/26),
+     discarding trajectories with heading change > HEADING_LIMIT_DEG.
   5. Applies the first control step (receding horizon).
 """
 
@@ -20,7 +21,9 @@ from optimizer import optimize_batch
 from goals import sample_goals
 from data import get_state, predict_obstacles
 from meta_cost import compute_meta_cost
-from config import NUM_OBS, DT, VMIN, VMAX, N
+from config import NUM_OBS, DT, VMIN, VMAX, N, HEADING_LIMIT_DEG
+
+T_START = 100   # NGSIM frame index to begin from (skip sparse early frames)
 
 
 def main():
@@ -31,9 +34,9 @@ def main():
     T_total = (N - 1) * DT   # physical planning horizon [s]
     vel_idx = N // 2          # mid-horizon index for stable velocity readout
 
-    ego, neighbors = get_state(0)
+    ego, neighbors = get_state(T_START)
 
-    for t in range(100):
+    for t in range(200):
 
         # Step 1: goal sampling (Section III-F, Eq. 26)
         goals = sample_goals(ego, neighbors)
@@ -46,9 +49,19 @@ def main():
             P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego
         )
 
-        # Step 4: meta-cost ranking (Section III-F, Eq. 25)
+        # Step 4: meta-cost ranking with heading filter
         y_pos = P @ cy.T   # (N, L) world-frame lateral positions
-        best  = compute_meta_cost(v, y_pos).argmin().item()
+        cost  = compute_meta_cost(v, y_pos)
+
+        # Discard trajectories with total heading change > HEADING_LIMIT_DEG.
+        # Heading is derived from velocity direction (chain rule: Pd/T @ cx).
+        xd_t      = (P_dot / T_total) @ cx.T            # (N, L) physical velocity
+        yd_t      = (P_dot / T_total) @ cy.T
+        psi_t     = torch.atan2(yd_t, xd_t)             # (N, L) heading angle
+        delta_deg = torch.abs(psi_t[-1] - psi_t[0]) * 180.0 / torch.pi  # (L,)
+        cost[delta_deg > HEADING_LIMIT_DEG] = float("inf")
+
+        best = cost.argmin().item()
 
         # Step 5: receding-horizon state advance
         # Position: evaluate polynomial at τ = 1/(N-1) (one DT step ahead)
@@ -74,9 +87,9 @@ def main():
             "vehicle_id": ego.get("vehicle_id"),
         }
 
-        _, neighbors = get_state(t + 1, ego_id=ego.get("vehicle_id"))
+        _, neighbors = get_state(T_START + t + 1, ego_id=ego.get("vehicle_id"))
 
-        print(f"Step {t:3d} | best={best} | "
+        print(f"Step {t:3d} | best={best} | delta_psi={delta_deg[best]:.1f}° | "
               f"x={x_next:.1f}  y={y_next:.2f}  vx={vx_next:.2f}")
 
 
