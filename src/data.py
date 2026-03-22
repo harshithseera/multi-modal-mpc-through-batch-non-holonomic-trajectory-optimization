@@ -224,12 +224,18 @@ def _get_state_ngsim(t, ego_id=None):
     return ego, neighbors
 
 
+_synthetic_neighbors_init = None
+
 def _get_state_synthetic(t):
     """
     Synthetic IDM-style scenario (Section IV).
 
-    Ego drives at 10 m/s; three neighbors drive at 8 m/s in adjacent lanes.
+    Ego drives at 10 m/s; three neighbors drive at constant speed
+    from fixed initial positions, giving smooth trajectories.
     """
+    global _synthetic_neighbors_init
+    import random
+
     x0 = float(t) * 10.0 * DT
 
     ego = {
@@ -237,14 +243,37 @@ def _get_state_synthetic(t):
         "vx": 10.0, "vy": 0.0, "vehicle_id": 0,
     }
 
+    if _synthetic_neighbors_init is None:
+        rng          = random.Random(42)
+        lane_options = [1.5, 5.5, 9.5, 13.5]
+        used_lanes   = []
+        _synthetic_neighbors_init = []
+        for i in range(NUM_OBS):
+            dx        = rng.uniform(50.0, 150.0)
+            available = [l for l in lane_options if l not in used_lanes]
+            if not available:
+                available = lane_options   # allow reuse if we run out of unique lanes
+            lane = rng.choice(available)
+            lane      = rng.choice(available)
+            used_lanes.append(lane)
+            vx        = rng.uniform(6.0, 10.0)
+            _synthetic_neighbors_init.append({
+                "x0": dx,    # offset from ego at t=0
+                "y":  lane,
+                "vx": vx,
+                "vehicle_id": i + 1,
+            })
+
     neighbors = [
         {
-            "x": x0 + 20 + i * 10,
-            "y": [1.5, 5.5, 9.5][i % 3],
-            "psi": 0.0, "vx": 8.0, "vy": 0.0,
-            "vehicle_id": i + 1,
+            "x":          nb["x0"] + nb["vx"] * t * DT,
+            "y":          nb["y"],
+            "psi":        0.0,
+            "vx":         nb["vx"],
+            "vy":         0.0,
+            "vehicle_id": nb["vehicle_id"],
         }
-        for i in range(NUM_OBS)
+        for nb in _synthetic_neighbors_init
     ]
 
     return ego, neighbors

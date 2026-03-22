@@ -12,7 +12,7 @@ import torch
 from config import VMAX, DEVICE
 
 
-def compute_meta_cost(v, y, mode="cruise", v_cruise=10.0, y_right=0.0, w1=1.0, w2=1.0):
+def compute_meta_cost(v, y, mode="cruise", v_cruise=15.0, y_right=0.0, w1=1.0, w2=1.0):
     """
     Compute a scalar meta-cost for each of the L trajectory hypotheses.
 

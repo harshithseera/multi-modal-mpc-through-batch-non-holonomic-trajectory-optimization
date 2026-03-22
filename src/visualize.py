@@ -40,7 +40,7 @@ T_START     = 100     # NGSIM frame index to begin from
 META_MODE   = "highway"
 Y_RIGHT     = 1.5     # right-lane lateral coordinate [m] for Eq. (26)
 W1, W2      = 1.0, 0.5
-PAUSE       = 0.01    # matplotlib pause between frames [s]
+PAUSE       = 0.001    # matplotlib pause between frames [s]
 
 VIEW_HALF_X     = 120.0   # half-width of scrolling viewport [m]
 ROAD_Y_MIN      = -1.0
