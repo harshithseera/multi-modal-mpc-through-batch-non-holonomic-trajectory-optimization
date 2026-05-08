@@ -1,58 +1,43 @@
-"""
-Meta-cost functions for ranking batch trajectory hypotheses.
-
-Paper reference: Section III-F (Goal Sampling and Meta-Cost), Eq. (25)–(26).
-
-After the batch optimizer produces L locally optimal trajectories, a
-scalar meta-cost is evaluated for each trajectory. The trajectory with
-the lowest meta-cost is selected as the MPC output (receding horizon step).
-"""
-
 import torch
-from config import VMAX, DEVICE
+import numpy as np
+from config import VCRUISE, VMAX
 
-
-def compute_meta_cost(v, y, mode="cruise", v_cruise=15.0, y_right=0.0, w1=1.0, w2=1.0):
+def compute_meta_cost(v, y, res_obs, mode="cruise"):
     """
-    Compute a scalar meta-cost for each of the L trajectory hypotheses.
-
-    Parameters
-    ----------
-    v : (L, N)
-        Velocity profile for each batch instance, as returned by optimize_batch.
-    y : (N, L)
-        Lateral position profile; P @ cy.T from optimize_batch.
-        Transposed to (L, N) internally before computing the sum.
-    mode : str
-        'cruise'  — Eq. (25): penalise deviation from v_cruise.
-        'highway' — Eq. (26): penalise deviation from VMAX and lateral offset
-                    from the right lane.
-    v_cruise : float
-        Target cruise speed [m/s] for mode='cruise'.
-    y_right : float
-        Lateral coordinate of the right lane [m] for mode='highway'.
-    w1, w2 : float
-        Weights for speed and lane terms in Eq. (26).
-
-    Returns
-    -------
-    cost : (L,)
-        Scalar meta-cost per trajectory; lower is better.
+    Official Implementation: Weighted Rank Sum.
+    v: (L, N)
+    y: (N, L)
+    res_obs: (N*num_obs, L)
     """
-    y_LN = y.T   # (L, N)
-
+    L_idx = v.shape[0]
+    y_LN = y.T # (L, N)
+    
+    # 1. Define Weights from official config.yaml
     if mode == "cruise":
-        # Eq. (25): sum_t (v(t) - v_cruise)²
-        cost = ((v - v_cruise) ** 2).sum(dim=1)
+        w = [50.0, 50.0, 0.0, 0.0] # [Cruise, Optimal/Safety, RightLane, MaxV]
+    else: # HSRL
+        w = [0.0, 50.0, 25.0, 25.0]
 
-    elif mode == "highway":
-        # Eq. (26): sum_t  w1·(v(t) - vmax)² + w2·(y(t) - y_right)²
-        cost = (
-            w1 * (v    - VMAX)    ** 2 +
-            w2 * (y_LN - y_right) ** 2
-        ).sum(dim=1)
+    # 2. Calculate Raw Metrics (Official get_ranks logic)
+    # Metric 1: Deviation from Cruise (15.0)
+    m1 = torch.norm(v - VCRUISE, p=2, dim=1)
+    # Metric 2: Collision Residual (Sum of violations)
+    m2 = torch.norm(res_obs, p=2, dim=0) 
+    # Metric 3: Rightmost Lane Adherence (official uses y = -10, we use LANE_CENTRES[0])
+    m3 = torch.norm(y_LN - 1.85, p=2, dim=1)
+    # Metric 4: Max Velocity (24.0)
+    m4 = torch.norm(v - VMAX, p=2, dim=1)
 
-    else:
-        raise ValueError(f"Unknown mode '{mode}'. Use 'cruise' or 'highway'.")
+    metrics = [m1, m2, m3, m4]
+    ranks = torch.zeros((4, L_idx), device=v.device)
 
-    return cost
+    # 3. Convert Metrics to Ranks (1 = best, L = worst)
+    for i in range(4):
+        # argsort gives indices of sorted values. 
+        # argsort of argsort gives the rank of the original index.
+        ranks[i] = torch.argsort(torch.argsort(metrics[i])).float() + 1.0
+
+    # 4. Weighted Rank Sum
+    total_cost = w[0]*ranks[0] + w[1]*ranks[1] + w[2]*ranks[2] + w[3]*ranks[3]
+    
+    return total_cost

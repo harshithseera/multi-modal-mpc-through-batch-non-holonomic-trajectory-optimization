@@ -13,7 +13,7 @@ Supports two data sources:
 import os
 import torch
 import pandas as pd
-from config import N, NUM_OBS, DT, L, DEVICE, A_OBS, B_OBS
+from config import *
 
 _CSV_PATH   = os.path.join(os.path.dirname(__file__), "data.csv")
 _CHUNK_SIZE = 50_000
@@ -169,22 +169,25 @@ def predict_obstacles(neighbors):
     -------
     obs_x, obs_y : (N * NUM_OBS, L)
         Obstacle position predictions, replicated across L batch instances.
+    
+    Crucially, this uses only current vx, vy.
     """
     num_obs = len(neighbors)
-    obs_x   = torch.zeros(N * num_obs, L, device=DEVICE)
-    obs_y   = torch.zeros(N * num_obs, L, device=DEVICE)
+    obs_x = torch.zeros(N * num_obs, L, device=DEVICE)
+    obs_y = torch.zeros(N * num_obs, L, device=DEVICE)
 
     for j, nb in enumerate(neighbors):
         x0, y0 = nb["x"], nb["y"]
         vx, vy = nb["vx"], nb["vy"]
-        for t in range(N):
-            obs_x[j * N + t, :] = x0 + vx * t * DT
-            obs_y[j * N + t, :] = y0 + vy * t * DT
+        for k in range(N):
+            # Extrapolate linearly
+            obs_x[j * N + k, :] = x0 + vx * (k * DT)
+            obs_y[j * N + k, :] = y0 + vy * (k * DT)
 
     return obs_x, obs_y
 
 
-def get_state(t, ego_id=None):
+def get_state(t, ego_id=None, advance=False):
     """
     Return the ego state and MPC neighbor list at MPC step t.
 
@@ -196,6 +199,8 @@ def get_state(t, ego_id=None):
         MPC time index (0-based index into the sorted frame list).
     ego_id : int, optional
         Vehicle ID to use as ego across frames for trajectory continuity.
+    advance : bool, optional
+        Whether to advance the synthetic scenario by one time step.
 
     Returns
     -------
@@ -206,7 +211,7 @@ def get_state(t, ego_id=None):
     """
     if os.path.exists(_CSV_PATH):
         return _get_state_ngsim(t, ego_id)
-    return _get_state_synthetic(t)
+    return _get_state_synthetic(t,current_ego = ego_id,advance=advance)
 
 
 def _get_state_ngsim(t, ego_id=None):
@@ -225,58 +230,76 @@ def _get_state_ngsim(t, ego_id=None):
 
 
 _synthetic_neighbors_init = None
+_synthetic_cache = {} # Persistent state for synthetic neighbor velocities
 
-def _get_state_synthetic(t):
+def _get_state_synthetic(t, current_ego=None, advance=False):
     """
     Synthetic IDM-style scenario (Section IV).
-
-    Ego drives at 10 m/s; three neighbors drive at constant speed
-    from fixed initial positions, giving smooth trajectories.
+    Neighbors move parallel to centerline but adapt vx to the car in front.
     """
-    global _synthetic_neighbors_init
-    import random
+    global _synthetic_cache, _synthetic_neighbors_init
+    
+    # 1. Ego State (centered in Lane 1: 5.55m)
+    if current_ego is not None:
+        ego = current_ego
+    else:
+        ego = {"x": 0.0, "y": 5.55, "psi": 0.0, "vx": 10.0, "vy": 0.0, "vehicle_id": 0}
 
-    x0 = float(t) * 10.0 * DT
-
-    ego = {
-        "x": x0, "y": 5.5, "psi": 0.0,
-        "vx": 10.0, "vy": 0.0, "vehicle_id": 0,
-    }
-
+    # 2. Initialization (One-time)
     if _synthetic_neighbors_init is None:
-        rng          = random.Random(42)
-        lane_options = [1.5, 5.5, 9.5, 13.5]
-        used_lanes   = []
+        import random
+        rng = random.Random(42)
+        lane_options = [1.85, 5.55, 9.25, 12.95, 16.65]
+        lane_reach = {lane: 10.0 for lane in lane_options}
         _synthetic_neighbors_init = []
-        for i in range(NUM_OBS):
-            dx        = rng.uniform(50.0, 150.0)
-            available = [l for l in lane_options if l not in used_lanes]
-            if not available:
-                available = lane_options   # allow reuse if we run out of unique lanes
-            lane = rng.choice(available)
-            lane      = rng.choice(available)
-            used_lanes.append(lane)
-            vx        = rng.uniform(6.0, 10.0)
+        
+        for i in range(15): # Generate a pool of 15 vehicles
+            lane = rng.choice(lane_options)
+            dx = lane_reach[lane] + rng.uniform(25.0, 40.0)
+            lane_reach[lane] = dx
+            v_target = rng.uniform(8.0, 10.0)
             _synthetic_neighbors_init.append({
-                "x0": dx,    # offset from ego at t=0
-                "y":  lane,
-                "vx": vx,
-                "vehicle_id": i + 1,
+                "id": i + 1, "x": dx, "y": lane, "v": v_target, "v_target": v_target
             })
+        _synthetic_cache = {n["id"]: n for n in _synthetic_neighbors_init}
 
-    neighbors = [
-        {
-            "x":          nb["x0"] + nb["vx"] * t * DT,
-            "y":          nb["y"],
-            "psi":        0.0,
-            "vx":         nb["vx"],
-            "vy":         0.0,
-            "vehicle_id": nb["vehicle_id"],
-        }
-        for nb in _synthetic_neighbors_init
+    # 3. Simulate IDM Step (Behavioral Reality)
+    # This runs every step t to update the "true" positions of neighbors
+    if advance:
+        dt_sim = DT
+        for nid in _synthetic_cache:
+            n = _synthetic_cache[nid]
+            # Find car in front in the SAME lane
+            lead_car = None
+            min_gap = 1000.0
+            for other_id in _synthetic_cache:
+                if other_id == nid: continue
+                other = _synthetic_cache[other_id]
+                if other["y"] == n["y"] and other["x"] > n["x"]:
+                    gap = other["x"] - n["x"]
+                    if gap < min_gap:
+                        min_gap = gap
+                        lead_car = other
+            
+            # Simple IDM speed adaptation
+            if lead_car and min_gap < 20.0:
+                # Slow down to match lead car speed with a safety buffer
+                n["v"] = max(n["v"] - 0.5, lead_car["v"]) 
+            else:
+                # Accelerate back to target speed
+                n["v"] = min(n["v"] + 0.1, n["v_target"])
+                
+            n["x"] += n["v"] * dt_sim
+
+    # 4. Filter for MPC (Section IV: Selection of NUM_OBS neighbors)
+    all_neighbors = [
+        {"x": n["x"], "y": n["y"], "psi": 0.0, "vx": n["v"], "vy": 0.0, "vehicle_id": n["id"]}
+        for n in _synthetic_cache.values()
     ]
-
-    return ego, neighbors
+    
+    # Sort by distance to ego and pick NUM_OBS
+    all_neighbors.sort(key=lambda v: (v["x"] - ego["x"])**2 + (v["y"] - ego["y"])**2)
+    return ego, all_neighbors
 
 
 def get_all_vehicles(t, ego_id=None):
@@ -323,5 +346,5 @@ def get_all_vehicles(t, ego_id=None):
 
         return ego, vehicles
 
-    ego, neighbors = _get_state_synthetic(t)
+    ego, neighbors = _get_state_synthetic(t,ego_id,advance=False)
     return ego, [ego] + neighbors
