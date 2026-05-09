@@ -30,7 +30,7 @@ MAX_ITERS  = 100    # Algorithm 1 iteration count
 # RHO_OBS must be large enough to overcome the smoothness cost — empirically
 # WFtF(obs) trace ≈ 190 vs smoothness trace ≈ 2400, so RHO_OBS >= 10 is needed.
 # All values kept ≤ 10 to avoid ill-conditioning the float64 KKT inversion.
-RHO_OBS    = 1.0   # ρ applied to collision constraint rows
+RHO_OBS    = 100.0   # ρ applied to collision constraint rows
 RHO_NONHOL = 1.0    # ρ applied to non-holonomic kinematic rows
 RHO_INEQ   = 1.0    # ρ applied to acceleration constraint rows
 
