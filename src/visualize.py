@@ -1,8 +1,5 @@
 """
-Highway Bird's-Eye MPC Visualization  —  run with: python src/visualize.py
-
-Saves output to mpc_output.mp4 via FFmpeg.
-Requires: pip install matplotlib and brew install ffmpeg (macOS).
+Highway Bird's-Eye MPC Visualization (Official Implementation Alignment)
 """
 import sys, os, math
 sys.path.insert(0, os.path.dirname(__file__))
@@ -85,8 +82,9 @@ def main():
     P, P_dot, P_ddot = build_basis()
     Fmat = build_F(P, P_dot, P_ddot, num_obs=NUM_OBS)
     A = build_A(P, P_dot)
-    T_total =N  * DT
+    T_total = (N - 1) * DT
     Pd = P_dot / T_total  # Physical derivative basis
+    vel_idx = N // 2
 
     ego, all_neighbors = get_state(T_START)
     neighbors = all_neighbors[:NUM_OBS]
@@ -104,9 +102,9 @@ def main():
 
     with writer.saving(fig, VIDEO_PATH, dpi=120):
         for t in range(MAX_STEPS):
-            goals = sample_goals(ego,t, mode='cruise')
+            goals = sample_goals(ego, t, mode='cruise')
             obs_x_w, obs_y_w = predict_obstacles(neighbors)
-            _, all_vehicles = get_all_vehicles(T_START + t, ego_id=ego)
+            _, all_vehicles = get_all_vehicles(T_START, ego_id=ego)
 
             cx, cy, cpsi, v_profile, res_obs = optimize_batch(
                 P, P_dot, P_ddot, Fmat, A, goals, obs_x_w, obs_y_w, ego)
@@ -130,15 +128,23 @@ def main():
 
             # 1. Advance position based on current heading and speed
         
-            vx_cmd = v_cmd * math.cos(psi_curr)
-            vy_cmd = v_cmd * math.sin(psi_curr)
-            x_next = ox + vx_cmd * DT
+            bcx, bcy = cx[best], cy[best]
+            x_next = (P[1] @ bcx).item()
+            y_next = (P[1] @ bcy).item()
+            vx_next = (P_dot[vel_idx] @ bcx).item() / T_total
+            vy_next = (P_dot[vel_idx] @ bcy).item() / T_total
             
-            y_next = oy + vy_cmd * DT
+            # 2. Get the planned heading at the first step
+            psi_next = (P[1] @ cpsi[best]).item()
+            
+            # 3. Use the optimized v_profile for the command label and vx/vy info
+            v_cmd = v_profile[best, :3].mean().item()
+            psi_curr = float(ego["psi"])
+            # vx_cmd = v_cmd * math.cos(psi_curr)
+            # vy_cmd = v_cmd * math.sin(psi_curr)
             
             # 2. Advance orientation based on heading rate
             psi_next = psi_curr + w_cmd * DT
-            v_cmd = math.sqrt(vx_cmd**2 + vy_cmd**2)
 
             # Update Trip Stats
             total_speed_sum += v_cmd
@@ -192,8 +198,8 @@ def main():
                 "x": x_next, 
                 "y": y_next, 
                 "psi": psi_next, 
-                "vx": vx_cmd, 
-                "vy": vy_cmd, 
+                "vx": vx_next, 
+                "vy": vy_next, 
                 "vehicle_id": 0
             }
             _, all_neighbors = get_state(T_START + t + 1, ego_id=ego, advance=True)

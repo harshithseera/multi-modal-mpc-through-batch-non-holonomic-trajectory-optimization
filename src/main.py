@@ -21,7 +21,7 @@ from optimizer import optimize_batch
 from goals import sample_goals
 from data import get_state, predict_obstacles
 from meta_cost import compute_meta_cost
-from config import NUM_OBS, DT, VMIN, VMAX, N, HEADING_LIMIT_DEG
+from config import *
 
 T_START = 100   # NGSIM frame index to begin from (skip sparse early frames)
 
@@ -29,7 +29,7 @@ T_START = 100   # NGSIM frame index to begin from (skip sparse early frames)
 def main():
     P, P_dot, P_ddot = build_basis()
     Fmat = build_F(P, P_dot, P_ddot, num_obs=NUM_OBS)
-    A    = build_A(P)   # (4, 2K) position-only boundary constraints (Eq. 8b)
+    A    = build_A(P, P_dot)   # (4, 2K) position-only boundary constraints (Eq. 8b)
 
     T_total = (N - 1) * DT   # physical planning horizon [s]
     vel_idx = N // 2          # mid-horizon index for stable velocity readout
@@ -39,19 +39,19 @@ def main():
     for t in range(200):
 
         # Step 1: goal sampling (Section III-F, Eq. 26)
-        goals = sample_goals(ego, neighbors)
+        goals = sample_goals(ego, t, mode = "cruise")
 
         # Step 2: constant-velocity obstacle prediction (Section III, Assumption 3)
-        obs_x, obs_y = predict_obstacles(neighbors)
+        obs_x, obs_y = predict_obstacles(neighbors[:NUM_OBS])
 
         # Step 3: batch trajectory optimisation (Algorithm 1)
-        cx, cy, cpsi, v = optimize_batch(
+        cx, cy, cpsi, v, res_obs = optimize_batch(
             P, P_dot, P_ddot, Fmat, A, goals, obs_x, obs_y, ego
         )
 
         # Step 4: meta-cost ranking with heading filter
         y_pos = P @ cy.T   # (N, L) world-frame lateral positions
-        cost  = compute_meta_cost(v, y_pos)
+        cost  = compute_meta_cost(v, y_pos, res_obs)
 
         # Discard trajectories with total heading change > HEADING_LIMIT_DEG.
         # Heading is derived from velocity direction (chain rule: Pd/T @ cx).
@@ -71,6 +71,18 @@ def main():
         y_next  = (P[1]           @ bcy).item()
         vx_next = (P_dot[vel_idx] @ bcx).item() / T_total
         vy_next = (P_dot[vel_idx] @ bcy).item() / T_total
+        
+        # Heading Rate (w)
+        # Physical psidot = Pd @ cpsi
+        psi_curr = float(ego["psi"])
+        psidot_profile = P_dot @ cpsi[best]
+        w_cmd = psidot_profile[:3].mean().item()
+        psi_next = psi_curr + w_cmd * DT
+
+        delta_deg = abs(psi_next - psi_curr) * 180.0 / math.pi
+        if delta_deg > HEADING_LIMIT_DEG:
+            print(f"Warning: Heading change {delta_deg:.1f}° exceeds limit. ")
+        cost[delta_deg > HEADING_LIMIT_DEG] = float("inf")
 
         speed = (vx_next**2 + vy_next**2) ** 0.5
         if speed > 1e-6:
@@ -81,15 +93,15 @@ def main():
         ego = {
             "x":          x_next,
             "y":          y_next,
-            "psi":        math.atan2(vy_next, vx_next) if speed > 0.01 else ego["psi"],
+            "psi":        psi_next,
             "vx":         vx_next,
             "vy":         vy_next,
             "vehicle_id": ego.get("vehicle_id"),
         }
 
-        _, neighbors = get_state(T_START + t + 1, ego_id=ego.get("vehicle_id"))
+        _, neighbors = get_state(T_START + t + 1, ego_id=ego)
 
-        print(f"Step {t:3d} | best={best} | delta_psi={delta_deg[best]:.1f}° | "
+        print(f"Step {t:3d} | best={best} | delta_psi={delta_deg}°| "
               f"x={x_next:.1f}  y={y_next:.2f}  vx={vx_next:.2f}")
 
 
